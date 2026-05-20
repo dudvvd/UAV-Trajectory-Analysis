@@ -1,0 +1,31 @@
+# Dataset and generated outputs
+data/
+outputs/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

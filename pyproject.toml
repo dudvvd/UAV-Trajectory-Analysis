@@ -12,6 +12,7 @@ dependencies = [
   "pandas>=2.0,<3.0",
   "opencv-python-headless>=4.8,<5.0",
   "matplotlib>=3.7,<4.0",
+  "scipy>=1.11,<2.0",
   "tqdm>=4.66,<5.0",
 ]
 

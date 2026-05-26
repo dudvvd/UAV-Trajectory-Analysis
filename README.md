@@ -1,214 +1,162 @@
-# UAV 相邻图像轨迹估计
+# Pure Vision UAV Localization
 
-本项目从无人机红外相机连续图像出发，使用传统计算机视觉方法估计相邻图像的相对运动，并从第一帧已知经度、纬度、高度递推后续轨迹。后续图像对应的真实经度、纬度和高度只用于验证误差，不参与轨迹估计算法。
+This project estimates UAV longitude, latitude, and altitude from an infrared
+image sequence using only the first frame pose as an initial condition. Ground
+truth GPS rows in the CSV are kept out of the prediction path and are used only
+for final error evaluation and visualization.
 
-当前实现不使用深度学习训练网络。主方案固定为 `ORB 特征 + RANSAC 仿射估计 + 关键帧局部配准 + 运动质量控制 + 平滑递推`。
+## Features
 
-代码阅读和二次开发说明见：[docs/CODE_GUIDE.md](docs/CODE_GUIDE.md)。
+- Exact timestamp matching between image filenames and CSV rows.
+- Automatic camera intrinsic estimation with cached `calibration.json`.
+- Long-window Shi-Tomasi + Lucas-Kanade feature tracking.
+- Forward-backward optical flow validation and RANSAC outlier rejection.
+- ORB fallback for large motion or unstable optical flow.
+- Homography-based scale and altitude estimation with conservative fallback.
+- Six-state EKF fusion over longitude, latitude, altitude, and velocity.
+- Blur frame detection with prediction-only EKF handling.
+- CSV and plot outputs for trajectory, error over time, and altitude.
 
-## 当前输入假设
+## Project Layout
 
-算法估计阶段只使用：
+```text
+.
++-- main.py
++-- config.py
++-- modules/
+|   +-- data_loader.py
+|   +-- camera_calibrator.py
+|   +-- feature_tracker.py
+|   +-- scale_estimator.py
+|   +-- ekf_localizer.py
+|   +-- evaluator.py
++-- utils/
+|   +-- geo_utils.py
+|   +-- visualization.py
++-- data/
+|   +-- IR-image/
+|   +-- position CSV
++-- output/
+```
 
-- 第一帧图像。
-- 第一帧经度、纬度、高度。
-- 后续连续图像序列。
-- 用户给定的相机水平视场角 `--horizontal-fov-deg`。
-- 用户给定的图像坐标系方向假设 `--yaw-deg`。
+## Input Format
 
-CSV 中后续帧的经度、纬度、高度只用于最后计算误差和绘图验证，不会用于标定、纠偏或递推。
+Images must be named by their 13-digit millisecond Unix timestamp:
 
-## 方法说明
+```text
+data/IR-image/1734763664200.jpg
+data/IR-image/1734763664400.jpg
+```
 
-当前主流程：
+The CSV must contain timestamp, longitude, latitude, and altitude columns:
 
-1. 读取图片和 CSV，按时间戳匹配。
-2. 只取选定起点帧的真实经纬高作为初始位置。
-3. 用 ORB 在红外图像中提取特征点。
-4. 使用 KNN + ratio test 筛选匹配点。
-5. 使用 RANSAC 估计相邻图像或关键帧到当前帧的部分仿射矩阵。
-6. 从仿射矩阵中取图像平移和尺度。
-7. 根据高度、视场角和航向假设把像素位移换算为 ENU 位移。
-8. 优先使用关键帧到当前帧的局部配准结果，减少逐帧累加噪声。
-9. 如果关键帧匹配质量不足，则回退到相邻帧估计。
-10. 如果相邻帧估计也低质量，则使用上一帧运动模型短时兜底。
-11. 对单步位移做限幅，并进行指数平滑。
-12. 从第一帧开始递推预测轨迹。
-13. 后续真实经纬高只在最后计算误差。
+```csv
+timestamp,longitude,latitude,altitude
+1734763664200,116.168975,38.8121207,483.54
+1734763664400,116.1690312,38.8121209,484.06
+```
 
-## 累积误差控制
+The image timestamp is matched exactly against the CSV timestamp string. Images
+without a matching CSV row are logged and skipped.
 
-无人机路径不重叠时，无法依靠回环检测消除全局漂移。因此项目当前的目标是降低局部噪声被逐帧累加的速度，而不是数学意义上完全消除漂移。
+## Installation
 
-已实现的优化：
-
-- **关键帧局部配准**：在短时间窗口内，优先用关键帧直接配准当前帧，避免把每一帧微小误差全部累加。
-- **相邻帧兜底**：关键帧匹配失败时，仍可用上一帧到当前帧的运动保持连续。
-- **质量门控**：使用 `confidence` 和 `inliers` 判断运动估计是否可靠。
-- **运动模型兜底**：低置信度帧使用上一帧平滑后的位移，减少异常匹配造成的轨迹突跳。
-- **单步限幅**：通过 `--max-step-m` 限制单帧最大水平位移。
-- **指数平滑**：通过 `--smoothing-alpha` 抑制相邻帧运动噪声。
-- **红外图像增强**：特征提取前使用 CLAHE 增强局部对比度。
-
-## 方法局限性
-
-### 1. 累积误差无法仅凭非重叠路径完全消除
-
-如果路径不重叠，且没有后续 GPS/RTK/IMU/地图约束，视觉里程计只能不断积分相对位移。任何相邻帧误差都会逐渐传递到后续轨迹。当前优化可以降低漂移速度，但不能保证长序列无漂移。
-
-### 2. 单目图像存在尺度不确定性
-
-仅凭相邻单目图像无法唯一确定真实尺度。当前通过 `--horizontal-fov-deg` 和高度估计像素到米的比例，因此视场角、高度和相机姿态误差会直接影响距离估计。
-
-### 3. 缺少无人机姿态和相机朝向
-
-当前用 `--yaw-deg` 人工假设图像坐标系与 ENU 坐标系的方向关系。如果实际航向、云台角或相机安装角未知，轨迹可能出现方向旋转、镜像或系统偏差。
-
-### 4. 高度估计不稳定
-
-`--estimate-altitude` 会尝试用图像仿射尺度估计高度变化，但尺度同时受姿态、地面起伏、场景深度和匹配质量影响。因此默认保持第一帧高度。
-
-### 5. 红外图像特征质量会影响匹配
-
-红外图像可能存在纹理少、重复纹理、运动模糊、曝光变化或压缩伪影，都会影响 ORB 匹配和 RANSAC 内点数量。
-
-### 6. 默认地面近似平面
-
-像素位移到地面位移换算默认相机近似俯视、地面近似平面。如果画面中有明显高差、建筑物、树木或非平面目标，几何误差会变大。
-
-## 建议补充的数据
-
-若希望进一步接近真实工程定位效果，建议补充以下数据。
-
-| 数据类型 | 具体内容 | 作用 |
-| --- | --- | --- |
-| 相机内参 | `fx/fy/cx/cy`、分辨率 | 替代粗略 FOV 假设，把像素转换为相机射线 |
-| 畸变参数 | 径向/切向畸变 | 去畸变后再匹配，减少边缘几何误差 |
-| 相机外参 | 相机相对机体的安装旋转和平移 | 将相机运动转换到无人机机体系 |
-| 无人机姿态 | roll、pitch、yaw 或四元数 | 将图像运动准确旋转到 ENU/NED |
-| 云台姿态 | 云台 yaw、pitch、roll | 处理相机朝向随云台变化的问题 |
-| 时间同步 | 图像、定位、IMU 的时间对应关系 | 避免错帧导致运动估计和验证不一致 |
-| 速度信息 | 飞控速度、IMU 积分速度或 GPS 速度 | 约束单帧位移，识别异常匹配 |
-| RTK/GNSS | 高精度定位轨迹 | 用于评估、少量纠偏或融合 |
-| DEM/地面高程 | 拍摄区域地面高度 | 将相机射线投影到真实地面 |
-
-最小推荐补充组合：
-
-1. 相机内参或真实水平/垂直 FOV。
-2. 每帧无人机 yaw、pitch、roll。
-3. 相机安装角或云台姿态。
-4. 图像和飞控日志的准确时间同步。
-
-## 后续改进方向
-
-- 使用相机内参、外参和姿态，将匹配点投影到地面平面或 DEM，再计算真实 ENU 位移。
-- 接入 IMU/GNSS，用扩展卡尔曼滤波或滑动窗口优化融合视觉相对位移和传感器约束。
-- 基于飞控速度约束单帧位移，替代当前固定 `--max-step-m`。
-- 保存匹配可视化图，定位低置信度或错误匹配帧。
-- 针对红外图像继续测试 CLAHE、去噪、锐化、网格化特征筛选和 KLT 光流。
-- 对长航线分段处理，定期使用可信传感器或地图约束重置漂移。
-
-## 环境安装
-
-按需求使用预先准备好的 conda 环境 `uav`：
+The repository has been tested with the existing `uav` conda environment:
 
 ```powershell
 conda activate uav
 python -m pip install -r requirements.txt
-python -m pip install -e .
 ```
 
-若不安装为包，也可以在项目根目录临时设置：
+Or run commands through conda without activating:
 
 ```powershell
-$env:PYTHONPATH = "src"
+conda run -n uav python main.py --max-frames 100
 ```
 
-## 数据结构
+## Quick Start
 
-项目默认读取：
+Run a short smoke test:
 
-- 图片目录：`data/IR-image`
-- 定位文件：`data/定位数据.csv`
+```powershell
+conda run -n uav python main.py --max-frames 100 --log-level INFO
+```
 
-CSV 需要包含字段：
+Run the full sequence:
+
+```powershell
+conda run -n uav python main.py
+```
+
+Force camera recalibration instead of using cached intrinsics:
+
+```powershell
+conda run -n uav python main.py --recalibrate
+```
+
+Use an explicit first frame and initial pose:
+
+```powershell
+conda run -n uav python main.py `
+  --first-image-path data/IR-image/1734763664200.jpg `
+  --initial-longitude 116.168975 `
+  --initial-latitude 38.8121207 `
+  --initial-altitude 483.54
+```
+
+If no initial pose is provided, the program uses the first selected CSV row only
+as the first-frame initial condition. Later CSV rows are not used for prediction.
+
+## Main Options
+
+| Option | Description |
+| --- | --- |
+| `--image-dir` | Infrared image directory. Default: `data/IR-image`. |
+| `--csv` | Validation GPS CSV. Default path is defined in `config.py`. |
+| `--output-dir` | Output directory. Default: `output`. |
+| `--first-image-path` | Optional first frame path. Timestamp selects the start frame. |
+| `--initial-longitude` | Initial longitude in degrees. |
+| `--initial-latitude` | Initial latitude in degrees. |
+| `--initial-altitude` | Initial altitude in meters. |
+| `--recalibrate` | Ignore cached calibration and estimate intrinsics again. |
+| `--max-frames` | Optional frame limit for development or testing. |
+| `--log-level` | Logging level: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+
+All algorithm thresholds and hyperparameters are centralized in `config.py`.
+
+## Outputs
+
+The pipeline writes:
 
 ```text
-时间戳,经度,纬度,高度
+output/
++-- calibration.json
++-- trajectory_comparison.png
++-- error_over_time.png
++-- altitude_comparison.png
++-- results.csv
 ```
 
-图片文件名需要是时间戳，例如 `1734763664200.jpg`。程序会按时间戳把图片和定位记录做内连接。
+`results.csv` contains predicted pose, ground truth pose, per-frame errors, and
+tracking diagnostics such as pixel displacement, inlier ratio, scale confidence,
+homography inliers, keyframe resets, blur score, and processing method.
 
-## 快速测试
+## Pipeline
 
-从第 0 帧开始，只处理 10 帧：
+1. `DataLoader` loads timestamp-sorted image paths and validation GPS rows.
+2. `CameraCalibrator` estimates or loads camera intrinsics.
+3. `FeatureTracker` tracks image features with LK optical flow and ORB fallback.
+4. `ScaleEstimator` estimates altitude and pixel-to-meter scale from homography.
+5. `EKFLocalizer` fuses visual deltas with a constant-velocity motion model.
+6. `Evaluator` computes errors and generates CSV/plots.
 
-```powershell
-conda run -n uav python run_trajectory.py --max-frames 10 --print-rows 10
-```
+## Important Notes
 
-从中间某段开始测试：
+This is a pure monocular visual odometry system. Without IMU, camera extrinsics,
+known yaw, map constraints, or loop closure, long-range drift is expected. The
+implementation reduces local noise and rejects poor frames, but it cannot fully
+remove accumulated drift on non-overlapping flight paths.
 
-```powershell
-conda run -n uav python run_trajectory.py --start-index 500 --max-frames 20 --print-rows 20
-```
-
-调节累积误差控制参数：
-
-```powershell
-conda run -n uav python run_trajectory.py --max-frames 100 --keyframe-max-interval 6 --smoothing-alpha 0.7 --max-step-m 20
-```
-
-## 运行全部数据
-
-```powershell
-conda run -n uav python run_trajectory.py
-```
-
-全量数据约 2.1 万张图片，运行时间取决于 CPU 性能。可以通过 `--max-width` 降低处理分辨率来提速，例如：
-
-```powershell
-conda run -n uav python run_trajectory.py --max-width 640
-```
-
-## 关键参数
-
-- `--start-index`：选定初始图像在匹配序列中的索引。
-- `--max-frames`：处理帧数；不填则处理全部。
-- `--horizontal-fov-deg`：相机水平视场角，默认 `30` 度。该默认值按当前数据小样本表现调小，实际项目应优先使用真实相机参数。
-- `--yaw-deg`：图像坐标系相对 ENU 的旋转角，默认 `-90` 度。该默认值更贴合当前数据中图像主运动方向与地理东向的关系。
-- `--max-width`：图像处理最大宽度，默认 `960`。
-- `--estimate-altitude`：使用图像仿射尺度估计高度变化；默认固定第一帧高度。
-- `--min-confidence`：运动估计最小置信度，默认 `0.35`。
-- `--min-inliers`：RANSAC 最小内点数，默认 `30`。
-- `--smoothing-alpha`：单步平滑权重，越大越相信当前帧，默认 `0.75`。
-- `--max-step-m`：单帧最大水平位移，默认 `30m`。
-- `--keyframe-max-interval`：一个关键帧最多维持的帧数，默认 `8`。
-
-## 结果字段
-
-结果 CSV 中主要字段：
-
-- `truth_longitude/truth_latitude/truth_altitude`：CSV 真实位置，仅用于验证。
-- `pred_longitude/pred_latitude/pred_altitude`：图像递推位置。
-- `horizontal_error_m`：水平误差。
-- `altitude_error_m`：高度误差。
-- `total_error_m`：三维误差。
-- `dx_px/dy_px/scale/confidence/matches/inliers`：最终用于递推的图像运动诊断信息。
-- `motion_source`：本帧使用的运动来源，可能为 `keyframe`、`adjacent` 或 `motion_model`。
-- `step_limited`：本帧单步位移是否被限幅。
-- `step_east_m/step_north_m`：本帧最终递推使用的 ENU 水平位移。
-- `raw_step_east_m/raw_step_north_m`：平滑前的 ENU 水平位移。
-
-## 开发流程总结
-
-1. 读取 CSV 并规范字段，把时间戳转为整数。
-2. 扫描图片目录，按图片文件名解析时间戳。
-3. 将图片和真实定位按时间戳匹配。
-4. 用第一帧真实经纬高建立局部 ENU 坐标参考。
-5. 对连续图片计算图像位移和尺度。
-6. 使用关键帧、质量门控、限幅和平滑降低局部累积误差。
-7. 从第一帧开始递推预测轨迹。
-8. 将预测轨迹转回经纬高。
-9. 只在验证阶段与后续真实数据计算误差。
-10. 保存逐帧结果 CSV，并绘制真实轨迹/预测轨迹图。
+For production-grade accuracy, provide camera intrinsics/extrinsics, UAV attitude
+or gimbal angles, and a reliable scale source such as IMU/GNSS velocity, laser
+altimeter, DEM, or map constraints.

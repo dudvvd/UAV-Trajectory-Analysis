@@ -15,7 +15,9 @@ from modules.data_loader import DataLoader, LoadedData
 from modules.ekf_localizer import EKFLocalizer
 from modules.evaluator import Evaluator
 from modules.feature_tracker import FeatureTracker
+from modules.scale_level_validator import ScaleLevelValidator
 from modules.scale_estimator import ScaleEstimator
+from modules.yaw_calibrator import YawCalibrator
 from utils.geo_utils import pixel_to_geo_delta
 
 
@@ -83,7 +85,20 @@ def run(args: argparse.Namespace) -> tuple[object, object]:
     if full_first is None:
         raise FileNotFoundError(data.image_paths[start])
     K = _scaled_intrinsics(calibration.K, first_gray.shape[:2], full_first.shape[:2])
-    scale_estimator = ScaleEstimator(K, initial_alt)
+    yaw_calibrator = YawCalibrator(float(K[0, 0]))
+    yaw_result = yaw_calibrator.calibrate(
+        data.image_paths,
+        data.gt_lon,
+        data.gt_lat,
+        initial_alt,
+        start,
+        end,
+    )
+    config.CAMERA_YAW_DEG = yaw_result.yaw_deg
+
+    scale_estimator = ScaleEstimator(K, initial_alt, calibration_confidence=calibration.confidence)
+    enabled_levels = ScaleLevelValidator(scale_estimator).validate(data.image_paths, start, end, initial_alt)
+    scale_estimator.enabled_levels = enabled_levels
     ekf = EKFLocalizer(initial_lon, initial_lat, initial_alt)
     tracker.initialize(first_gray)
 
@@ -102,6 +117,13 @@ def run(args: argparse.Namespace) -> tuple[object, object]:
             "inlier_ratio": 1.0,
             "scale_confidence": 1.0,
             "homography_inliers": 0,
+            "scale_method": 4,
+            "divergence_ratio": np.nan,
+            "affine_scale": np.nan,
+            "raw_alt_estimate": initial_alt,
+            "ekf_alt": initial_alt,
+            "yaw_deg": config.CAMERA_YAW_DEG,
+            "ekf_update_mode": 1,
             "is_keyframe_reset": True,
             "num_tracked": 0,
             "blur_score": FeatureTracker.blur_score(first_gray),
@@ -119,21 +141,46 @@ def run(args: argparse.Namespace) -> tuple[object, object]:
             if blur < config.BLUR_LAPLACIAN_THRESHOLD:
                 logging.info("Blur frame skipped at %s: laplacian_var=%.2f", data.timestamps[i], blur)
                 state = ekf.state
-                records.append(_record(data, i, state, blur, skipped_blur=True))
+                records.append(
+                    _record(
+                        data,
+                        i,
+                        state,
+                        blur,
+                        skipped_blur=True,
+                        yaw_deg=config.CAMERA_YAW_DEG,
+                        ekf_update_mode=3,
+                    )
+                )
                 continue
 
             tracking = tracker.track(curr_gray)
-            scale = scale_estimator.estimate(tracking.prev_points, tracking.curr_points, tracking.homography)
+            scale = scale_estimator.estimate(
+                tracking.prev_points,
+                tracking.curr_points,
+                tracking.homography,
+                curr_gray.shape[:2],
+                dt,
+                float(state.velocity[2]),
+                state.altitude,
+            )
             delta_lon, delta_lat = pixel_to_geo_delta(
                 tracking.pixel_dx,
                 tracking.pixel_dy,
                 scale.estimated_altitude,
                 scale_estimator.fx,
                 state.latitude,
+                config.CAMERA_YAW_DEG,
             )
             delta_alt = scale.estimated_altitude - state.altitude
-            confidence = tracking.inlier_ratio * scale.scale_confidence
-            state = ekf.update_delta(delta_lon, delta_lat, delta_alt, confidence, dt)
+            state, update_mode = ekf.update_visual(
+                delta_lon,
+                delta_lat,
+                delta_alt,
+                tracking.inlier_ratio,
+                scale.scale_confidence,
+                dt,
+            )
             records.append(
                 _record(
                     data,
@@ -145,6 +192,12 @@ def run(args: argparse.Namespace) -> tuple[object, object]:
                     inlier_ratio=tracking.inlier_ratio,
                     scale_confidence=scale.scale_confidence,
                     homography_inliers=scale.homography_inliers,
+                    scale_method=scale.scale_method,
+                    divergence_ratio=scale.divergence_ratio,
+                    affine_scale=scale.affine_scale,
+                    raw_alt_estimate=scale.raw_alt_estimate,
+                    yaw_deg=config.CAMERA_YAW_DEG,
+                    ekf_update_mode=update_mode,
                     is_keyframe_reset=tracking.is_keyframe_reset,
                     num_tracked=tracking.num_tracked,
                     method=tracking.method,
@@ -152,7 +205,17 @@ def run(args: argparse.Namespace) -> tuple[object, object]:
             )
         except Exception as exc:
             logging.exception("Frame %s failed; EKF prediction kept: %s", data.timestamps[i], exc)
-            records.append(_record(data, i, ekf.state, float("nan"), method="exception"))
+            records.append(
+                _record(
+                    data,
+                    i,
+                    ekf.state,
+                    float("nan"),
+                    method="exception",
+                    yaw_deg=config.CAMERA_YAW_DEG,
+                    ekf_update_mode=3,
+                )
+            )
 
     evaluator = Evaluator(output_dir)
     result, summary = evaluator.evaluate(records)
@@ -170,6 +233,12 @@ def _record(
     inlier_ratio: float = 0.0,
     scale_confidence: float = 0.0,
     homography_inliers: int = 0,
+    scale_method: int = 4,
+    divergence_ratio: float = float("nan"),
+    affine_scale: float = float("nan"),
+    raw_alt_estimate: float | None = None,
+    yaw_deg: float = 0.0,
+    ekf_update_mode: int = 3,
     is_keyframe_reset: bool = False,
     num_tracked: int = 0,
     skipped_blur: bool = False,
@@ -189,6 +258,13 @@ def _record(
         "inlier_ratio": inlier_ratio,
         "scale_confidence": scale_confidence,
         "homography_inliers": homography_inliers,
+        "scale_method": scale_method,
+        "divergence_ratio": divergence_ratio,
+        "affine_scale": affine_scale,
+        "raw_alt_estimate": state.altitude if raw_alt_estimate is None else raw_alt_estimate,
+        "ekf_alt": state.altitude,
+        "yaw_deg": yaw_deg,
+        "ekf_update_mode": ekf_update_mode,
         "is_keyframe_reset": is_keyframe_reset,
         "num_tracked": num_tracked,
         "blur_score": blur_score,

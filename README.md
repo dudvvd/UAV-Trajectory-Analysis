@@ -12,8 +12,9 @@ for final error evaluation and visualization.
 - Long-window Shi-Tomasi + Lucas-Kanade feature tracking.
 - Forward-backward optical flow validation and RANSAC outlier rejection.
 - ORB fallback for large motion or unstable optical flow.
-- Homography-based scale and altitude estimation with conservative fallback.
-- Six-state EKF fusion over longitude, latitude, altitude, and velocity.
+- Automatic camera yaw calibration from early GPS direction and visual direction.
+- Four-level scale and altitude estimation with conservative fallback.
+- Selective EKF updates that skip unreliable position or altitude observations.
 - Blur frame detection with prediction-only EKF handling.
 - CSV and plot outputs for trajectory, error over time, and altitude.
 
@@ -28,6 +29,8 @@ for final error evaluation and visualization.
 |   +-- camera_calibrator.py
 |   +-- feature_tracker.py
 |   +-- scale_estimator.py
+|   +-- yaw_calibrator.py
+|   +-- scale_level_validator.py
 |   +-- ekf_localizer.py
 |   +-- evaluator.py
 +-- utils/
@@ -141,14 +144,26 @@ output/
 tracking diagnostics such as pixel displacement, inlier ratio, scale confidence,
 homography inliers, keyframe resets, blur score, and processing method.
 
+Additional diagnostics are included for the repaired scale, yaw, and EKF paths:
+
+- `scale_method`: active scale level, where 1 is divergence, 2 is affine scale, 3 is homography, and 4 is EKF altitude velocity fallback.
+- `divergence_ratio`: raw feature-point divergence ratio.
+- `affine_scale`: raw affine scale factor.
+- `raw_alt_estimate`: altitude estimate before EKF fusion.
+- `ekf_alt`: EKF-smoothed altitude.
+- `yaw_deg`: calibrated yaw correction used for the run.
+- `ekf_update_mode`: 1 updates position and altitude, 2 updates position only, 3 prediction only.
+
 ## Pipeline
 
 1. `DataLoader` loads timestamp-sorted image paths and validation GPS rows.
 2. `CameraCalibrator` estimates or loads camera intrinsics.
-3. `FeatureTracker` tracks image features with LK optical flow and ORB fallback.
-4. `ScaleEstimator` estimates altitude and pixel-to-meter scale from homography.
-5. `EKFLocalizer` fuses visual deltas with a constant-velocity motion model.
-6. `Evaluator` computes errors and generates CSV/plots.
+3. `YawCalibrator` aligns early visual directions to early GPS directions.
+4. `ScaleLevelValidator` checks which scale levels are useful on the sequence.
+5. `FeatureTracker` tracks image features with LK optical flow and ORB fallback.
+6. `ScaleEstimator` estimates altitude with divergence, affine, homography, and EKF fallback levels.
+7. `EKFLocalizer` selectively fuses visual deltas with a constant-velocity motion model.
+8. `Evaluator` computes errors and generates CSV/plots.
 
 ## Important Notes
 

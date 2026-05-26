@@ -37,9 +37,12 @@ class CameraCalibrator:
 
     def estimate(self, image_paths: list[Path]) -> CalibrationResult:
         if self.cache_path.exists() and not self.recalibrate:
-            LOGGER.info("Loading cached camera calibration from %s", self.cache_path)
             with self.cache_path.open("r", encoding="utf-8") as f:
-                return CalibrationResult(**json.load(f))
+                cached = CalibrationResult(**json.load(f))
+            if cached.method != "empirical" or cached.confidence >= 0.7:
+                LOGGER.info("Loading cached camera calibration from %s", self.cache_path)
+                return cached
+            LOGGER.warning("Ignoring low-confidence empirical calibration cache and recalibrating")
 
         first = cv2.imread(str(image_paths[0]), cv2.IMREAD_GRAYSCALE)
         if first is None:
@@ -157,10 +160,6 @@ class CameraCalibrator:
         min_f = max(width, height) * config.FOCAL_MIN_FACTOR
         max_f = max(width, height) * config.FOCAL_MAX_FACTOR
         if not min_f <= f <= max_f:
-            return False
-        edge_margin = 0.05 * (max_f - min_f)
-        if f <= min_f + edge_margin or f >= max_f - edge_margin:
-            LOGGER.warning("Camera calibration focal %.2f is too close to search boundary", f)
             return False
         if result.method == "fundamental" and result.confidence < (1.0 - config.ESSENTIAL_SINGULAR_VALUE_TOL):
             return False

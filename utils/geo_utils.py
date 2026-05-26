@@ -27,12 +27,20 @@ def pixel_to_geo_delta(
     altitude_m: float,
     fx: float,
     current_latitude_deg: float,
+    yaw_deg: float = 0.0,
 ) -> tuple[float, float]:
-    """Convert image displacement to longitude and latitude increments."""
+    """Convert image displacement to longitude and latitude increments.
+
+    Pixel displacement is first interpreted in the camera image plane, then
+    rotated into the local east/north frame by the calibrated yaw angle.
+    """
 
     meters_per_pixel = altitude_m / max(float(fx), 1e-6)
-    delta_north = -pixel_dy * meters_per_pixel
-    delta_east = pixel_dx * meters_per_pixel
+    delta_cam_x = pixel_dx * meters_per_pixel
+    delta_cam_y = pixel_dy * meters_per_pixel
+    yaw = radians(yaw_deg)
+    delta_east = cos(yaw) * delta_cam_x - sin(yaw) * delta_cam_y
+    delta_north = sin(yaw) * delta_cam_x + cos(yaw) * delta_cam_y
     lat_rad = radians(current_latitude_deg)
     delta_lat = delta_north / METERS_PER_DEG_LAT
     delta_lon = delta_east / (METERS_PER_DEG_LAT * max(cos(lat_rad), 1e-6))

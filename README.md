@@ -27,10 +27,12 @@ for final error evaluation and visualization.
 +-- modules/
 |   +-- data_loader.py
 |   +-- camera_calibrator.py
-|   +-- feature_tracker.py
-|   +-- scale_estimator.py
 |   +-- yaw_calibrator.py
-|   +-- scale_level_validator.py
+|   +-- start_frame_checker.py
+|   +-- flight_phase_detector.py
+|   +-- feature_tracker.py
+|   +-- physics_constraint.py
+|   +-- scale_estimator.py
 |   +-- ekf_localizer.py
 |   +-- evaluator.py
 +-- utils/
@@ -137,33 +139,43 @@ output/
 +-- trajectory_comparison.png
 +-- error_over_time.png
 +-- altitude_comparison.png
++-- phase_distribution.png
 +-- results.csv
 ```
 
 `results.csv` contains predicted pose, ground truth pose, per-frame errors, and
 tracking diagnostics such as pixel displacement, inlier ratio, scale confidence,
-homography inliers, keyframe resets, blur score, and processing method.
+flight phase, physical constraint flags, keyframe resets, blur score, and
+processing method.
 
 Additional diagnostics are included for the repaired scale, yaw, and EKF paths:
 
 - `scale_method`: active scale level, where 1 is divergence, 2 is affine scale, 3 is homography, and 4 is EKF altitude velocity fallback.
 - `divergence_ratio`: raw feature-point divergence ratio.
 - `affine_scale`: raw affine scale factor.
+- `consistency_diff`: divergence and affine scale difference.
+- `pixels_per_meter_used`: per-frame scale used for pixel-to-meter conversion.
+- `is_alt_fixed`: whether cruise fixed-scale mode is active.
+- `flight_phase`: A for climb/descent, B for cruise, C for transition.
+- `phase_confidence`: confidence of the current phase classification.
+- `physics_flag`: 0 normal, 1 horizontal clip, 2 altitude clip, 3 consistency replacement.
 - `raw_alt_estimate`: altitude estimate before EKF fusion.
-- `ekf_alt`: EKF-smoothed altitude.
 - `yaw_deg`: calibrated yaw correction used for the run.
+- `ekf_innovation_alt`: altitude innovation before EKF update.
 - `ekf_update_mode`: 1 updates position and altitude, 2 updates position only, 3 prediction only.
 
 ## Pipeline
 
 1. `DataLoader` loads timestamp-sorted image paths and validation GPS rows.
-2. `CameraCalibrator` estimates or loads camera intrinsics.
-3. `YawCalibrator` aligns early visual directions to early GPS directions.
-4. `ScaleLevelValidator` checks which scale levels are useful on the sequence.
-5. `FeatureTracker` tracks image features with LK optical flow and ORB fallback.
-6. `ScaleEstimator` estimates altitude with divergence, affine, homography, and EKF fallback levels.
-7. `EKFLocalizer` selectively fuses visual deltas with a constant-velocity motion model.
-8. `Evaluator` computes errors and generates CSV/plots.
+2. `StartFrameChecker` selects a sharp and trackable start frame.
+3. `CameraCalibrator` estimates or loads camera intrinsics.
+4. `YawCalibrator` aligns early visual directions to early GPS directions and can persist `CAMERA_YAW_DEG`.
+5. `FlightPhaseDetector` classifies climb/descent, cruise, or transition from estimated altitude history.
+6. `FeatureTracker` tracks image features with LK optical flow and ORB fallback.
+7. `PhysicsConstraint` clips impossible horizontal, vertical, and inconsistent frame motion.
+8. `ScaleEstimator` estimates altitude with compensated divergence, affine scale, homography, and EKF fallback levels.
+9. `EKFLocalizer` selectively fuses visual observations with phase-aware process and observation noise.
+10. `Evaluator` computes errors and generates CSV/plots.
 
 ## Important Notes
 

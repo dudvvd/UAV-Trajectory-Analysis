@@ -20,6 +20,10 @@
   "fy": 1920.0,
   "cx": 320.0,
   "cy": 256.0,
-  "method": "fundamental",
-  "confidence": 0.9224813542839783
+  "confidence": 0.9925531539692606,
+  "method": "fundamental+motion_prior+motion_prior",
+  "image_size": [
+    640,
+    512
+  ]
 }

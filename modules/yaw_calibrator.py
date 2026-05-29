@@ -1,31 +1,29 @@
-"""One-time yaw calibration from early GPS direction and visual motion."""
+"""Camera yaw calibration from GPS direction and visual direction."""
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
-from math import cos, radians, sin
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 import config
-from modules.feature_tracker import FeatureTracker
 from utils.geo_utils import lonlat_to_local_m
 
-LOGGER = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
+@dataclass
 class YawCalibrationResult:
     yaw_deg: float
-    visual_vectors: list[tuple[float, float]]
-    gps_vectors: list[tuple[float, float]]
-    used_frames: int
+    used: bool
+    total_gps_displacement_m: float
+    mean_direction_error_deg: float
 
 
 class YawCalibrator:
-    """Estimate camera-to-ENU yaw by aligning visual directions to GPS directions."""
+    """Estimate pixel-to-East/North rotation using direction angles only."""
 
     def __init__(self, fx: float) -> None:
         self.fx = float(fx)
@@ -33,78 +31,96 @@ class YawCalibrator:
     def calibrate(
         self,
         image_paths: list[Path],
-        gt_lon: list[float],
-        gt_lat: list[float],
+        gt_lon: np.ndarray,
+        gt_lat: np.ndarray,
         altitude_m: float,
-        start: int,
-        end: int,
+        start_index: int,
+        frame_count: int = config.YAW_CALIBRATION_FRAMES,
     ) -> YawCalibrationResult:
-        sample_end = min(end, start + config.YAW_CALIBRATION_FRAMES)
-        if sample_end - start < 3:
-            LOGGER.warning("Yaw calibration skipped: not enough frames")
-            return YawCalibrationResult(config.CAMERA_YAW_DEG, [], [], 0)
+        end = min(len(image_paths), start_index + frame_count)
+        if end - start_index < 3:
+            return YawCalibrationResult(0.0, False, 0.0, 180.0)
 
-        east, north = lonlat_to_local_m(
-            np.asarray(gt_lon[start:sample_end]),
-            np.asarray(gt_lat[start:sample_end]),
-            float(gt_lon[start]),
-            float(gt_lat[start]),
-        )
-        gps_steps = np.column_stack([np.diff(east), np.diff(north)])
-        total_gps = float(np.sum(np.linalg.norm(gps_steps, axis=1)))
+        east, north = lonlat_to_local_m(gt_lon[start_index:end], gt_lat[start_index:end], gt_lon[start_index], gt_lat[start_index])
+        gps_vec = np.column_stack([np.diff(east), np.diff(north)])
+        total_gps = float(np.linalg.norm([east[-1] - east[0], north[-1] - north[0]]))
         if total_gps < config.YAW_MIN_GPS_DISPLACEMENT_M:
-            LOGGER.warning("Yaw calibration skipped: first %d frames move only %.2f m", sample_end - start, total_gps)
-            return YawCalibrationResult(config.CAMERA_YAW_DEG, [], [], 0)
+            logging.warning("Yaw calibration skipped: GPS direction baseline %.2fm is too small", total_gps)
+            return YawCalibrationResult(0.0, False, total_gps, 180.0)
 
-        tracker = FeatureTracker()
-        first_gray = tracker.read_gray(image_paths[start])
-        tracker.initialize(first_gray)
-        visual_vectors: list[tuple[float, float]] = []
-        gps_vectors: list[tuple[float, float]] = []
-        meters_per_pixel = altitude_m / max(self.fx, 1e-6)
+        vis_vec = self._visual_vectors(image_paths[start_index:end])
+        n = min(len(gps_vec), len(vis_vec))
+        gps_vec, vis_vec = gps_vec[:n], vis_vec[:n]
+        valid = (np.linalg.norm(gps_vec, axis=1) > 0.2) & (np.linalg.norm(vis_vec, axis=1) > 0.2)
+        if np.count_nonzero(valid) < 3:
+            logging.warning("Yaw calibration skipped: not enough visual/GPS direction pairs")
+            return YawCalibrationResult(0.0, False, total_gps, 180.0)
 
-        for idx in range(start + 1, sample_end):
-            gray = tracker.read_gray(image_paths[idx])
-            if FeatureTracker.blur_score(gray) < config.BLUR_LAPLACIAN_THRESHOLD:
-                tracker.initialize(gray)
-                continue
-            tracking = tracker.track(gray)
-            gps_step = gps_steps[idx - start - 1]
-            if tracking.inlier_ratio <= 0.5:
-                continue
-            if np.linalg.norm(gps_step) < 0.05:
-                continue
-            visual_vectors.append((tracking.pixel_dx * meters_per_pixel, tracking.pixel_dy * meters_per_pixel))
-            gps_vectors.append((float(gps_step[0]), float(gps_step[1])))
-
-        if len(visual_vectors) < 3:
-            LOGGER.warning("Yaw calibration skipped: only %d usable visual/GPS pairs", len(visual_vectors))
-            return YawCalibrationResult(config.CAMERA_YAW_DEG, visual_vectors, gps_vectors, len(visual_vectors))
-
-        visual = np.asarray(visual_vectors, dtype=float)
-        gps = np.asarray(gps_vectors, dtype=float)
+        gps_unit = self._unit(gps_vec[valid])
+        vis_unit = self._unit(vis_vec[valid])
 
         def objective(theta_deg: float) -> float:
-            theta = radians(theta_deg)
-            R = np.array([[cos(theta), -sin(theta)], [sin(theta), cos(theta)]], dtype=float)
-            rotated = visual @ R.T
-            dot = np.sum(rotated * gps, axis=1)
-            denom = np.linalg.norm(rotated, axis=1) * np.linalg.norm(gps, axis=1)
-            valid = denom > 1e-9
-            cosang = np.clip(dot[valid] / denom[valid], -1.0, 1.0)
-            return float(np.mean(1.0 - cosang))
+            theta = np.deg2rad(theta_deg)
+            rot = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+            pred = vis_unit @ rot.T
+            dot = np.clip(np.sum(pred * gps_unit, axis=1), -1.0, 1.0)
+            return float(np.mean(1.0 - dot))
 
-        try:
-            from scipy.optimize import minimize_scalar
+        yaw = self._minimize_angle(objective)
+        mean_error = float(np.rad2deg(np.arccos(np.clip(1.0 - objective(yaw), -1.0, 1.0))))
+        if config.PERSIST_CALIBRATED_YAW:
+            self._persist_yaw(yaw)
+        logging.info("Yaw calibrated: %.2f deg, mean direction error %.2f deg", yaw, mean_error)
+        return YawCalibrationResult(yaw, True, total_gps, mean_error)
 
-            result = minimize_scalar(objective, bounds=(-180.0, 180.0), method="bounded")
-            yaw = float(result.x)
-        except Exception as exc:
-            LOGGER.warning("SciPy yaw optimization unavailable; using grid fallback: %s", exc)
-            coarse = np.linspace(-180.0, 180.0, 721)
-            best = float(coarse[int(np.argmin([objective(v) for v in coarse]))])
-            fine = np.linspace(best - 1.0, best + 1.0, 401)
-            yaw = float(fine[int(np.argmin([objective(v) for v in fine]))])
+    def _visual_vectors(self, image_paths: list[Path]) -> np.ndarray:
+        vectors: list[list[float]] = []
+        prev = self._read_gray(image_paths[0])
+        pts = cv2.goodFeaturesToTrack(prev, maxCorners=config.MAX_CORNERS, qualityLevel=config.QUALITY_LEVEL, minDistance=config.MIN_DISTANCE)
+        for path in image_paths[1:]:
+            curr = self._read_gray(path)
+            if pts is None or len(pts) < 30:
+                pts = cv2.goodFeaturesToTrack(prev, maxCorners=config.MAX_CORNERS, qualityLevel=config.QUALITY_LEVEL, minDistance=config.MIN_DISTANCE)
+            p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, curr, pts, None, winSize=config.LK_WIN_SIZE, maxLevel=config.LK_MAX_LEVEL)
+            if p1 is None or st is None:
+                vectors.append([0.0, 0.0])
+            else:
+                valid = st.reshape(-1) == 1
+                delta = p1.reshape(-1, 2)[valid] - pts.reshape(-1, 2)[valid]
+                vectors.append(np.median(delta, axis=0).tolist() if len(delta) else [0.0, 0.0])
+                pts = p1[valid].reshape(-1, 1, 2) if np.any(valid) else None
+            prev = curr
+        return np.asarray(vectors, dtype=float)
 
-        LOGGER.info("Yaw calibration: yaw_deg=%.2f using %d pairs", yaw, len(visual_vectors))
-        return YawCalibrationResult(yaw, visual_vectors, gps_vectors, len(visual_vectors))
+    @staticmethod
+    def _unit(vectors: np.ndarray) -> np.ndarray:
+        return vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9)
+
+    @staticmethod
+    def _minimize_angle(objective) -> float:
+        candidates = np.linspace(-180.0, 180.0, 361)
+        values = np.asarray([objective(v) for v in candidates])
+        best = float(candidates[int(np.argmin(values))])
+        for step in (0.5, 0.1, 0.02):
+            candidates = np.arange(best - 1.0, best + 1.0 + step, step)
+            values = np.asarray([objective(v) for v in candidates])
+            best = float(candidates[int(np.argmin(values))])
+        return best
+
+    @staticmethod
+    def _persist_yaw(yaw_deg: float) -> None:
+        config_path = Path(config.__file__).resolve()
+        text = config_path.read_text(encoding="utf-8")
+        updated = re.sub(r"^CAMERA_YAW_DEG\s*=\s*[-+0-9.eE]+", f"CAMERA_YAW_DEG = {yaw_deg:.8f}", text, flags=re.MULTILINE)
+        if updated != text:
+            config_path.write_text(updated, encoding="utf-8")
+
+    @staticmethod
+    def _read_gray(path: Path) -> np.ndarray:
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(path)
+        if img.shape[1] > config.MAX_PROCESS_WIDTH:
+            scale = config.MAX_PROCESS_WIDTH / img.shape[1]
+            img = cv2.resize(img, (config.MAX_PROCESS_WIDTH, int(img.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+        return img

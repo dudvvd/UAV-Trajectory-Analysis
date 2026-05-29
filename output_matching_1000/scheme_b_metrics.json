@@ -1,0 +1,8 @@
+{
+  "horizontal_mae": 983.2189174944317,
+  "horizontal_rmse": 1189.842487476374,
+  "horizontal_max": 2169.688015801173,
+  "final_horizontal_error": 2169.688015801173,
+  "altitude_mae": 232.41684999999998,
+  "matcher_backend": "sift"
+}

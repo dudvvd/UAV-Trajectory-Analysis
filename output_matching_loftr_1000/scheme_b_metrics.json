@@ -1,0 +1,8 @@
+{
+  "horizontal_mae": 972.8303303010873,
+  "horizontal_rmse": 1177.586092516556,
+  "horizontal_max": 2148.0385695484756,
+  "final_horizontal_error": 2148.0385695484756,
+  "altitude_mae": 232.41684999999998,
+  "matcher_backend": "loftr"
+}

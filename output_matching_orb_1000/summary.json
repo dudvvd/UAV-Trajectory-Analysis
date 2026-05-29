@@ -1,0 +1,21 @@
+{
+  "scheme_b": {
+    "horizontal_mae": 979.6066987401201,
+    "horizontal_rmse": 1185.5599152814837,
+    "horizontal_max": 2161.4905856066416,
+    "final_horizontal_error": 2161.4905856066416,
+    "altitude_mae": 232.41684999999998,
+    "matcher_backend": "orb"
+  },
+  "scheme_d": {
+    "horizontal_mae": 970.7391631868577,
+    "horizontal_rmse": 1176.4223958566927,
+    "horizontal_max": 2150.4693005145105,
+    "final_horizontal_error": 2150.4693005145105,
+    "altitude_mae": 232.41684999999998,
+    "matcher_backend": "orb"
+  },
+  "frames": 1000,
+  "fx": 1357.2385463590624,
+  "note": "torch/kornia unavailable; SIFT/ORB matcher backend used as a pluggable stand-in for deep matching."
+}

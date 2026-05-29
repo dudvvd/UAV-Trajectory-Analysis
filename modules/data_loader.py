@@ -1,112 +1,123 @@
-"""Timestamp-exact data loading for UAV image sequences."""
+"""Timestamp-exact data loading for infrared frames and GPS truth."""
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 import config
 
-LOGGER = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True)
 class LoadedData:
     timestamps: list[str]
     image_paths: list[Path]
-    gt_lon: list[float]
-    gt_lat: list[float]
-    gt_alt: list[float]
-    delta_t: list[float]
+    gt_lon: np.ndarray
+    gt_lat: np.ndarray
+    gt_alt: np.ndarray
+    delta_t: np.ndarray
+    start_index: int = 0
 
 
 class DataLoader:
-    """Load image paths and validation GPS rows by exact timestamp string."""
+    """Load image paths and ground truth by exact timestamp string matching."""
 
-    def __init__(self, image_dir: Path, csv_path: Path) -> None:
+    def __init__(self, image_dir: Path = config.IMAGE_DIR, csv_path: Path = config.CSV_PATH) -> None:
         self.image_dir = Path(image_dir)
         self.csv_path = Path(csv_path)
 
     def load(self) -> LoadedData:
-        gps = self._read_csv()
-        gps_by_timestamp = gps.set_index("timestamp", drop=False)
-        rows: list[dict[str, object]] = []
-        skipped = 0
+        if not self.image_dir.exists():
+            raise FileNotFoundError(f"Image directory not found: {self.image_dir}")
+        if not self.csv_path.exists():
+            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
 
-        for image_path in sorted(self.image_dir.iterdir(), key=lambda p: p.stem):
-            if image_path.suffix.lower() not in config.IMAGE_EXTENSIONS:
-                continue
-            timestamp = image_path.stem.strip()
-            if timestamp not in gps_by_timestamp.index:
-                skipped += 1
-                LOGGER.warning("Timestamp %s has image but no CSV row; skipped", timestamp)
-                continue
-            gps_row = gps_by_timestamp.loc[timestamp]
-            if isinstance(gps_row, pd.DataFrame):
-                gps_row = gps_row.iloc[0]
-            rows.append(
-                {
-                    "timestamp": timestamp,
-                    "image_path": image_path,
-                    "lon": float(gps_row["longitude"]),
-                    "lat": float(gps_row["latitude"]),
-                    "alt": float(gps_row["altitude"]),
-                }
-            )
+        df = self._read_csv()
+        ts_col = self._find_column(df.columns, config.TIMESTAMP_COLUMNS, "timestamp")
+        lon_col = self._find_column(df.columns, config.LON_COLUMNS, "longitude")
+        lat_col = self._find_column(df.columns, config.LAT_COLUMNS, "latitude")
+        alt_col = self._find_column(df.columns, config.ALT_COLUMNS, "altitude")
 
-        if len(rows) < 2:
-            raise ValueError("Need at least two timestamp-matched frames.")
+        truth = df[[ts_col, lon_col, lat_col, alt_col]].copy()
+        truth[ts_col] = truth[ts_col].astype(str).str.strip()
+        truth = truth.drop_duplicates(ts_col, keep="first").set_index(ts_col)
 
-        rows.sort(key=lambda r: int(str(r["timestamp"])))
-        ts = [str(r["timestamp"]) for r in rows]
-        ts_float = np.asarray(ts, dtype=np.float64)
-        delta_t = [0.0] + ((ts_float[1:] - ts_float[:-1]) / 1000.0).astype(float).tolist()
-        if skipped:
-            LOGGER.info("Skipped %d images because exact CSV timestamp match was missing", skipped)
+        image_map = self._collect_images()
+        matched = sorted(set(image_map).intersection(truth.index), key=self._timestamp_key)
+        if len(matched) < 2:
+            raise ValueError("Need at least two exact timestamp matches between images and CSV")
 
+        gt = truth.loc[matched]
+        timestamps = list(matched)
+        image_paths = [image_map[t] for t in timestamps]
+        delta_t = self._delta_t_seconds(timestamps)
         return LoadedData(
-            timestamps=ts,
-            image_paths=[Path(r["image_path"]) for r in rows],
-            gt_lon=[float(r["lon"]) for r in rows],
-            gt_lat=[float(r["lat"]) for r in rows],
-            gt_alt=[float(r["alt"]) for r in rows],
+            timestamps=timestamps,
+            image_paths=image_paths,
+            gt_lon=gt[lon_col].astype(float).to_numpy(),
+            gt_lat=gt[lat_col].astype(float).to_numpy(),
+            gt_alt=gt[alt_col].astype(float).to_numpy(),
             delta_t=delta_t,
         )
 
+    def slice_from(self, data: LoadedData, start_index: int, end_index: int | None = None) -> LoadedData:
+        end = len(data.timestamps) if end_index is None else end_index
+        return LoadedData(
+            timestamps=data.timestamps[start_index:end],
+            image_paths=data.image_paths[start_index:end],
+            gt_lon=data.gt_lon[start_index:end],
+            gt_lat=data.gt_lat[start_index:end],
+            gt_alt=data.gt_alt[start_index:end],
+            delta_t=data.delta_t[start_index:end],
+            start_index=start_index,
+        )
+
     def _read_csv(self) -> pd.DataFrame:
-        encodings = ("utf-8-sig", "utf-8", "gb18030", "gbk")
-        last_error: Exception | None = None
-        for encoding in encodings:
+        errors: list[str] = []
+        for encoding in ("utf-8-sig", "utf-8", "gbk", "gb18030"):
             try:
-                df = pd.read_csv(self.csv_path, encoding=encoding)
-                break
+                return pd.read_csv(self.csv_path, encoding=encoding)
             except UnicodeDecodeError as exc:
-                last_error = exc
-        else:
-            raise ValueError(f"Cannot decode CSV {self.csv_path}: {last_error}")
+                errors.append(f"{encoding}: {exc}")
+        raise UnicodeDecodeError("csv", b"", 0, 1, "; ".join(errors))
 
-        rename = {}
-        for column in df.columns:
-            clean = str(column).strip()
-            if clean in ("时间戳", "timestamp", "time"):
-                rename[column] = "timestamp"
-            elif clean in ("经度", "longitude", "lon"):
-                rename[column] = "longitude"
-            elif clean in ("纬度", "latitude", "lat"):
-                rename[column] = "latitude"
-            elif clean in ("高度", "altitude", "alt"):
-                rename[column] = "altitude"
-        df = df.rename(columns=rename)
-        required = {"timestamp", "longitude", "latitude", "altitude"}
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"CSV missing required columns: {sorted(missing)}")
+    def _collect_images(self) -> dict[str, Path]:
+        images: dict[str, Path] = {}
+        for path in self.image_dir.iterdir():
+            if path.is_file() and path.suffix.lower() in config.IMAGE_EXTENSIONS:
+                images[path.stem.strip()] = path
+        if not images:
+            raise FileNotFoundError(f"No images found in {self.image_dir}")
+        return images
 
-        df["timestamp"] = df["timestamp"].astype(str).str.strip()
-        for col in ("longitude", "latitude", "altitude"):
-            df[col] = pd.to_numeric(df[col], errors="raise")
-        return df.drop_duplicates("timestamp").reset_index(drop=True)
+    @staticmethod
+    def _find_column(columns: Iterable[str], aliases: Iterable[str], logical_name: str) -> str:
+        normalized = {str(col).strip().lower(): col for col in columns}
+        for alias in aliases:
+            key = alias.strip().lower()
+            if key in normalized:
+                return normalized[key]
+        if len(list(columns)) >= 4:
+            fallback = list(columns)[{"timestamp": 0, "longitude": 1, "latitude": 2, "altitude": 3}[logical_name]]
+            return fallback
+        raise ValueError(f"Cannot find {logical_name} column in CSV")
+
+    @staticmethod
+    def _timestamp_key(timestamp: str) -> tuple[int, str]:
+        try:
+            return int(timestamp), timestamp
+        except ValueError:
+            return 0, timestamp
+
+    @staticmethod
+    def _delta_t_seconds(timestamps: list[str]) -> np.ndarray:
+        values = np.array([float(t) for t in timestamps], dtype=float)
+        diffs = np.diff(values, prepend=values[0]) / 1000.0
+        if len(diffs) > 1:
+            diffs[0] = diffs[1]
+        diffs[diffs <= 0] = np.median(diffs[diffs > 0]) if np.any(diffs > 0) else 0.2
+        return diffs

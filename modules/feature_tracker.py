@@ -1,4 +1,4 @@
-"""Long-window LK feature tracking with ORB fallback for difficult frames."""
+"""Feature tracking with LK optical flow, validation, and ORB fallback."""
 
 from __future__ import annotations
 
@@ -11,200 +11,235 @@ import numpy as np
 
 import config
 
-LOGGER = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
+@dataclass
 class TrackingResult:
     pixel_dx: float
     pixel_dy: float
     inlier_ratio: float
+    affine_matrix: np.ndarray | None
     is_keyframe_reset: bool
     num_tracked: int
     prev_points: np.ndarray
     curr_points: np.ndarray
-    homography: np.ndarray | None
+    residual_px: float
     method: str
+    affine_rotation_deg: float
+    phase_dx: float
+    phase_dy: float
+    phase_response: float
+    fourier_rotation_deg: float
+    fourier_response: float
 
 
 class FeatureTracker:
-    """Track Shi-Tomasi features using forward-backward LK optical flow."""
+    """Maintain sparse features and estimate frame-to-frame affine motion."""
 
     def __init__(self) -> None:
         self.prev_gray: np.ndarray | None = None
-        self.key_gray: np.ndarray | None = None
-        self.prev_points: np.ndarray | None = None
-        self.key_points: np.ndarray | None = None
-        self.frames_since_key = 0
-        self._orb = cv2.ORB_create(nfeatures=config.ORB_NFEATURES, fastThreshold=7)
-        self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        self.points: np.ndarray | None = None
+        self.orb = cv2.ORB_create(nfeatures=config.ORB_NFEATURES, scoreType=cv2.ORB_HARRIS_SCORE)
 
     def initialize(self, gray: np.ndarray) -> None:
-        enhanced = self._enhance(gray)
-        points = cv2.goodFeaturesToTrack(
-            enhanced,
-            maxCorners=config.MAX_CORNERS,
-            qualityLevel=config.QUALITY_LEVEL,
-            minDistance=config.MIN_DISTANCE,
-        )
         self.prev_gray = gray
-        self.key_gray = gray
-        self.prev_points = points
-        self.key_points = points.copy() if points is not None else None
-        self.frames_since_key = 0
-        LOGGER.info("Feature tracker initialized with %d points", 0 if points is None else len(points))
+        self.points = self._detect_grid(gray)
 
     def track(self, curr_gray: np.ndarray) -> TrackingResult:
-        if self.prev_gray is None or self.prev_points is None or len(self.prev_points) < 8:
-            self.initialize(curr_gray)
-            return self._empty(True, "reinit")
-
-        lk_params = dict(
-            winSize=config.LK_WIN_SIZE,
-            maxLevel=config.LK_MAX_LEVEL,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        )
-        p1, st1, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, curr_gray, self.prev_points, None, **lk_params)
-        if p1 is None or st1 is None:
-            orb_result = self._orb_fallback(curr_gray)
-            self._reset_keyframe(curr_gray)
-            return orb_result
-        p0_back, st2, _ = cv2.calcOpticalFlowPyrLK(curr_gray, self.prev_gray, p1, None, **lk_params)
-        if p0_back is None or st2 is None:
-            orb_result = self._orb_fallback(curr_gray)
-            self._reset_keyframe(curr_gray)
-            return orb_result
-
-        p0 = self.prev_points.reshape(-1, 2)
-        p1r = p1.reshape(-1, 2)
-        p0b = p0_back.reshape(-1, 2)
-        status = (st1.reshape(-1) == 1) & (st2.reshape(-1) == 1)
-        fb_error = np.linalg.norm(p0 - p0b, axis=1)
-        keep = status & (fb_error <= config.FB_CHECK_THRESHOLD_PX)
-        old = p0[keep].astype(np.float32)
-        new = p1r[keep].astype(np.float32)
-        initial_count = len(p0)
-
-        if len(old) < 8:
-            orb_result = self._orb_fallback(curr_gray)
-            self._reset_keyframe(curr_gray)
-            return orb_result
-
-        affine, mask = cv2.estimateAffinePartial2D(
-            old,
-            new,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=config.RANSAC_REPROJ_THRESHOLD,
-            maxIters=1500,
-            confidence=0.99,
-        )
-        if affine is None or mask is None:
-            orb_result = self._orb_fallback(curr_gray)
-            self._reset_keyframe(curr_gray)
-            return orb_result
-
-        inlier_mask = mask.reshape(-1).astype(bool)
-        old_in = old[inlier_mask]
-        new_in = new[inlier_mask]
-        residual = float(np.mean(np.linalg.norm((old @ affine[:, :2].T + affine[:, 2]) - new, axis=1)))
-        if residual > config.ROTATION_RESIDUAL_THRESHOLD_PX:
-            LOGGER.info("LK residual %.2f px; using ORB fallback for this frame", residual)
-            result = self._orb_fallback(curr_gray)
-            self.prev_gray = curr_gray
-            self.prev_points = cv2.goodFeaturesToTrack(
-                self._enhance(curr_gray),
-                maxCorners=config.MAX_CORNERS,
-                qualityLevel=config.QUALITY_LEVEL,
-                minDistance=config.MIN_DISTANCE,
-            )
-            return result
-
-        # Optical flow measures ground texture motion in the image. UAV motion
-        # over ground is the opposite displacement under a nadir camera model.
-        dx = float(-np.median(new_in[:, 0] - old_in[:, 0]))
-        dy = float(-np.median(new_in[:, 1] - old_in[:, 1]))
-        inlier_ratio = float(len(old_in) / max(initial_count, 1))
-        homography = None
-        if len(old_in) >= 4:
-            homography, _ = cv2.findHomography(old_in, new_in, cv2.RANSAC, config.RANSAC_REPROJ_THRESHOLD)
-
-        self.frames_since_key += 1
-        reset = inlier_ratio < config.MIN_TRACK_RATIO or self.frames_since_key >= config.TRACK_WINDOW
-        self.prev_gray = curr_gray
-        self.prev_points = new_in.reshape(-1, 1, 2)
-        if reset:
-            LOGGER.info("Keyframe reset: inlier_ratio=%.2f tracked=%d", inlier_ratio, len(old_in))
-            self._reset_keyframe(curr_gray)
-
-        return TrackingResult(dx, dy, inlier_ratio, reset, len(old_in), old_in, new_in, homography, "lk")
-
-    def _orb_fallback(self, curr_gray: np.ndarray) -> TrackingResult:
         if self.prev_gray is None:
-            return self._empty(False, "orb")
-        kp1, des1 = self._orb.detectAndCompute(self._enhance(self.prev_gray), None)
-        kp2, des2 = self._orb.detectAndCompute(self._enhance(curr_gray), None)
-        if des1 is None or des2 is None or len(kp1) < 8 or len(kp2) < 8:
-            return self._empty(False, "orb")
-        matches = self._matcher.knnMatch(des1, des2, k=2)
-        good = [m for m, n in matches if m.distance < config.ORB_RATIO_TEST * n.distance]
-        if len(good) < 8:
-            return self._empty(False, "orb")
-        old = np.float32([kp1[m.queryIdx].pt for m in good])
-        new = np.float32([kp2[m.trainIdx].pt for m in good])
-        affine, mask = cv2.estimateAffinePartial2D(old, new, method=cv2.RANSAC, ransacReprojThreshold=3.0)
-        if affine is None or mask is None:
-            return self._empty(False, "orb")
-        inliers = mask.reshape(-1).astype(bool)
-        old_in = old[inliers]
-        new_in = new[inliers]
-        homography = None
-        if len(old_in) >= 4:
-            homography, _ = cv2.findHomography(old_in, new_in, cv2.RANSAC, config.RANSAC_REPROJ_THRESHOLD)
-        return TrackingResult(
-            float(-affine[0, 2]),
-            float(-affine[1, 2]),
-            float(len(old_in) / max(len(good), 1)),
-            False,
-            int(len(old_in)),
-            old_in,
-            new_in,
-            homography,
-            "orb",
-        )
+            self.initialize(curr_gray)
+            return self._empty_result(True)
+        if self.points is None or len(self.points) < config.MIN_POINTS:
+            self.points = self._detect_grid(self.prev_gray)
 
-    def _reset_keyframe(self, gray: np.ndarray) -> None:
-        points = cv2.goodFeaturesToTrack(
-            self._enhance(gray),
-            maxCorners=config.MAX_CORNERS,
-            qualityLevel=config.QUALITY_LEVEL,
-            minDistance=config.MIN_DISTANCE,
-        )
-        self.key_gray = gray
-        self.prev_gray = gray
-        self.key_points = points
-        self.prev_points = points
-        self.frames_since_key = 0
+        phase_dx, phase_dy, phase_response = self._phase_correlate(self.prev_gray, curr_gray)
+        fourier_rotation_deg, fourier_response = self._fourier_mellin_rotation(self.prev_gray, curr_gray)
+        result = self._track_lk(curr_gray)
+        if result.residual_px > config.ROTATION_RESIDUAL_THRESHOLD_PX or result.num_tracked < 20:
+            logging.info("LK residual %.2fpx; using ORB fallback", result.residual_px)
+            result = self._track_orb(curr_gray)
+        result.phase_dx = phase_dx
+        result.phase_dy = phase_dy
+        result.phase_response = phase_response
+        result.fourier_rotation_deg = fourier_rotation_deg
+        result.fourier_response = fourier_response
+        if self._should_use_phase_direction(result, phase_dx, phase_dy, phase_response):
+            result.pixel_dx = phase_dx
+            result.pixel_dy = phase_dy
+            result.method = f"{result.method}+phase"
+
+        reset = result.is_keyframe_reset or result.inlier_ratio < config.MIN_TRACK_RATIO
+        self.prev_gray = curr_gray
+        if reset:
+            self.points = self._detect_grid(curr_gray)
+            result.is_keyframe_reset = True
+            logging.info("Feature keyframe reset with %d points", 0 if self.points is None else len(self.points))
+        else:
+            self.points = result.curr_points.reshape(-1, 1, 2).astype(np.float32)
+            if len(self.points) < config.MIN_POINTS:
+                self.points = self._merge_points(curr_gray, self.points)
+        return result
+
+    def _track_lk(self, curr_gray: np.ndarray) -> TrackingResult:
+        assert self.prev_gray is not None
+        pts0 = self.points
+        if pts0 is None or len(pts0) == 0:
+            return self._empty_result(True)
+        pts1, st, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, curr_gray, pts0, None, winSize=config.LK_WIN_SIZE, maxLevel=config.LK_MAX_LEVEL)
+        if pts1 is None or st is None:
+            return self._empty_result(True)
+        back, st_back, _ = cv2.calcOpticalFlowPyrLK(curr_gray, self.prev_gray, pts1, None, winSize=config.LK_WIN_SIZE, maxLevel=config.LK_MAX_LEVEL)
+        valid = (st.reshape(-1) == 1) & (st_back.reshape(-1) == 1)
+        p0 = pts0.reshape(-1, 2)[valid]
+        p1 = pts1.reshape(-1, 2)[valid]
+        b0 = back.reshape(-1, 2)[valid]
+        fb = np.linalg.norm(p0 - b0, axis=1) if len(p0) else np.array([])
+        keep = fb <= config.FB_CHECK_THRESHOLD_PX
+        return self._estimate_motion(p0[keep], p1[keep], len(pts0), float(np.mean(fb)) if len(fb) else 999.0, "lk", curr_gray.shape[:2])
+
+    def _track_orb(self, curr_gray: np.ndarray) -> TrackingResult:
+        assert self.prev_gray is not None
+        kp0, des0 = self.orb.detectAndCompute(self.prev_gray, None)
+        kp1, des1 = self.orb.detectAndCompute(curr_gray, None)
+        if des0 is None or des1 is None:
+            return self._empty_result(True, "orb")
+        pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(des0, des1, k=2)
+        good = [m for m, n in pairs if m.distance < config.ORB_RATIO_TEST * n.distance]
+        p0 = np.float32([kp0[m.queryIdx].pt for m in good])
+        p1 = np.float32([kp1[m.trainIdx].pt for m in good])
+        return self._estimate_motion(p0, p1, max(len(kp0), 1), 0.0, "orb", curr_gray.shape[:2])
+
+    def _estimate_motion(self, p0: np.ndarray, p1: np.ndarray, total: int, residual: float, method: str, image_shape: tuple[int, int]) -> TrackingResult:
+        if len(p0) < 3:
+            return self._empty_result(True, method)
+        A, mask = cv2.estimateAffinePartial2D(p0, p1, method=cv2.RANSAC, ransacReprojThreshold=config.RANSAC_REPROJ_THRESHOLD)
+        if A is None or mask is None:
+            delta = np.median(p1 - p0, axis=0)
+            inliers = np.ones(len(p0), dtype=bool)
+        else:
+            inliers = mask.reshape(-1).astype(bool)
+            h, w = image_shape
+            center = np.array([w * 0.5, h * 0.5, 1.0], dtype=float)
+            warped_center = A @ center
+            delta = warped_center - center[:2]
+        ratio = float(np.count_nonzero(inliers) / max(total, 1))
+        rotation = self._rotation_deg(A)
+        return TrackingResult(float(delta[0]), float(delta[1]), ratio, A, False, int(np.count_nonzero(inliers)), p0[inliers], p1[inliers], residual, method, rotation, np.nan, np.nan, 0.0, np.nan, 0.0)
+
+    def _phase_correlate(self, prev_gray: np.ndarray, curr_gray: np.ndarray) -> tuple[float, float, float]:
+        w, h = config.PHASE_CORR_SIZE
+        prev = cv2.resize(prev_gray, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+        curr = cv2.resize(curr_gray, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+        prev = prev - cv2.GaussianBlur(prev, (0, 0), 3)
+        curr = curr - cv2.GaussianBlur(curr, (0, 0), 3)
+        window = cv2.createHanningWindow((w, h), cv2.CV_32F)
+        (dx, dy), response = cv2.phaseCorrelate(prev, curr, window)
+        sx = prev_gray.shape[1] / float(w)
+        sy = prev_gray.shape[0] / float(h)
+        return float(dx * sx), float(dy * sy), float(response)
+
+    def _fourier_mellin_rotation(self, prev_gray: np.ndarray, curr_gray: np.ndarray) -> tuple[float, float]:
+        if not config.COMPUTE_FOURIER_MELLIN:
+            return np.nan, 0.0
+        w, h = config.FOURIER_MELLIN_SIZE
+        prev = cv2.resize(prev_gray, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+        curr = cv2.resize(curr_gray, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+        prev = self._normalize_for_frequency(prev)
+        curr = self._normalize_for_frequency(curr)
+        window = cv2.createHanningWindow((w, h), cv2.CV_32F)
+        mag0 = self._fft_log_magnitude(prev * window)
+        mag1 = self._fft_log_magnitude(curr * window)
+        center = (w * 0.5, h * 0.5)
+        max_radius = min(center)
+        flags = cv2.WARP_POLAR_LOG + cv2.WARP_FILL_OUTLIERS
+        polar0 = cv2.warpPolar(mag0, (w, h), center, max_radius, flags)
+        polar1 = cv2.warpPolar(mag1, (w, h), center, max_radius, flags)
+        (shift_x, shift_y), response = cv2.phaseCorrelate(polar0.astype(np.float32), polar1.astype(np.float32))
+        rotation = -shift_y * 360.0 / float(h)
+        if rotation > 180.0:
+            rotation -= 360.0
+        if rotation < -180.0:
+            rotation += 360.0
+        if abs(rotation) > config.FOURIER_MELLIN_MAX_ABS_ROTATION_DEG:
+            return np.nan, float(response)
+        return float(rotation), float(response)
 
     @staticmethod
-    def _enhance(gray: np.ndarray) -> np.ndarray:
-        return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    def _normalize_for_frequency(gray: np.ndarray) -> np.ndarray:
+        blurred = cv2.GaussianBlur(gray, (0, 0), 3)
+        high = gray - blurred
+        high -= float(high.mean())
+        std = float(high.std())
+        if std > 1e-6:
+            high /= std
+        return high
 
     @staticmethod
-    def read_gray(image_path: Path, max_width: int = config.MAX_PROCESS_WIDTH) -> np.ndarray:
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise FileNotFoundError(image_path)
-        h, w = image.shape[:2]
-        if w > max_width:
-            scale = max_width / float(w)
-            image = cv2.resize(image, (max_width, int(round(h * scale))), interpolation=cv2.INTER_AREA)
-        return image
+    def _fft_log_magnitude(gray: np.ndarray) -> np.ndarray:
+        spectrum = np.fft.fft2(gray)
+        spectrum = np.fft.fftshift(spectrum)
+        magnitude = np.ascontiguousarray(np.log1p(np.abs(spectrum)).astype(np.float32))
+        return cv2.normalize(magnitude, None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+    @staticmethod
+    def _should_use_phase_direction(result: TrackingResult, phase_dx: float, phase_dy: float, response: float) -> bool:
+        if not config.PHASE_CORR_PREFER_FOR_DIRECTION or response < config.PHASE_CORR_MIN_RESPONSE:
+            return False
+        phase_norm = float(np.hypot(phase_dx, phase_dy))
+        lk_norm = float(np.hypot(result.pixel_dx, result.pixel_dy))
+        if phase_norm < 1.0:
+            return False
+        if lk_norm < 1.0:
+            return True
+        dot = np.clip((phase_dx * result.pixel_dx + phase_dy * result.pixel_dy) / (phase_norm * lk_norm), -1.0, 1.0)
+        diff = float(np.rad2deg(np.arccos(dot)))
+        return diff > config.PHASE_CORR_DIRECTION_DIFF_DEG or result.inlier_ratio < config.MIN_TRACK_RATIO
+
+    @staticmethod
+    def _rotation_deg(A: np.ndarray | None) -> float:
+        if A is None:
+            return np.nan
+        return float(np.rad2deg(np.arctan2(A[1, 0], A[0, 0])))
+
+    def _detect_grid(self, gray: np.ndarray) -> np.ndarray | None:
+        h, w = gray.shape[:2]
+        points: list[np.ndarray] = []
+        per_cell = max(8, config.MAX_CORNERS // (config.GRID_ROWS * config.GRID_COLS))
+        for r in range(config.GRID_ROWS):
+            for c in range(config.GRID_COLS):
+                y0, y1 = r * h // config.GRID_ROWS, (r + 1) * h // config.GRID_ROWS
+                x0, x1 = c * w // config.GRID_COLS, (c + 1) * w // config.GRID_COLS
+                roi = gray[y0:y1, x0:x1]
+                pts = cv2.goodFeaturesToTrack(roi, maxCorners=per_cell, qualityLevel=config.QUALITY_LEVEL, minDistance=config.MIN_DISTANCE)
+                if pts is not None:
+                    pts[:, 0, 0] += x0
+                    pts[:, 0, 1] += y0
+                    points.append(pts)
+        if not points:
+            return None
+        return np.vstack(points).astype(np.float32)[: config.MAX_CORNERS]
+
+    def _merge_points(self, gray: np.ndarray, existing: np.ndarray) -> np.ndarray:
+        new = self._detect_grid(gray)
+        if new is None:
+            return existing
+        merged = np.vstack([existing.reshape(-1, 1, 2), new.reshape(-1, 1, 2)])
+        return merged[: config.MAX_CORNERS].astype(np.float32)
+
+    @staticmethod
+    def read_gray(path: Path) -> np.ndarray:
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(path)
+        if img.shape[1] > config.MAX_PROCESS_WIDTH:
+            scale = config.MAX_PROCESS_WIDTH / img.shape[1]
+            img = cv2.resize(img, (config.MAX_PROCESS_WIDTH, int(img.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+        return img
 
     @staticmethod
     def blur_score(gray: np.ndarray) -> float:
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     @staticmethod
-    def _empty(reset: bool, method: str) -> TrackingResult:
+    def _empty_result(reset: bool, method: str = "lk") -> TrackingResult:
         empty = np.empty((0, 2), dtype=np.float32)
-        return TrackingResult(0.0, 0.0, 0.0, reset, 0, empty, empty, None, method)
+        return TrackingResult(0.0, 0.0, 0.0, None, reset, 0, empty, empty, 999.0, method, np.nan, np.nan, np.nan, 0.0, np.nan, 0.0)

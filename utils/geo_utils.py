@@ -1,24 +1,46 @@
-"""Geographic helpers used by localization and evaluation."""
+"""Geographic conversion helpers for local UAV motion."""
 
 from __future__ import annotations
 
-from math import asin, cos, radians, sin, sqrt
+from math import atan2, cos, radians, sin, sqrt
 
 import numpy as np
 
-EARTH_RADIUS_M = 6_378_137.0
-METERS_PER_DEG_LAT = 111_320.0
+EARTH_RADIUS_M = 6371008.8
+METERS_PER_DEG_LAT = 111320.0
 
 
 def haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    """Return great-circle horizontal distance in meters."""
+    """Return great-circle distance in meters."""
+    lon1_r, lat1_r, lon2_r, lat2_r = map(radians, (lon1, lat1, lon2, lat2))
+    d_lon = lon2_r - lon1_r
+    d_lat = lat2_r - lat1_r
+    a = sin(d_lat / 2.0) ** 2 + cos(lat1_r) * cos(lat2_r) * sin(d_lon / 2.0) ** 2
+    return 2.0 * EARTH_RADIUS_M * atan2(sqrt(a), sqrt(max(0.0, 1.0 - a)))
 
-    phi1 = radians(lat1)
-    phi2 = radians(lat2)
-    dphi = radians(lat2 - lat1)
-    dlambda = radians(lon2 - lon1)
-    a = sin(dphi / 2.0) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2.0) ** 2
-    return 2.0 * EARTH_RADIUS_M * asin(sqrt(a))
+
+def lonlat_to_local_m(
+    lon: np.ndarray | float,
+    lat: np.ndarray | float,
+    ref_lon: float,
+    ref_lat: float,
+) -> tuple[np.ndarray | float, np.ndarray | float]:
+    """Convert lon/lat to local east/north meters around a reference point."""
+    east = (np.asarray(lon) - ref_lon) * METERS_PER_DEG_LAT * cos(radians(ref_lat))
+    north = (np.asarray(lat) - ref_lat) * METERS_PER_DEG_LAT
+    return east, north
+
+
+def local_m_to_lonlat(
+    east: float,
+    north: float,
+    ref_lon: float,
+    ref_lat: float,
+) -> tuple[float, float]:
+    """Convert local east/north meters back to lon/lat."""
+    lat = ref_lat + north / METERS_PER_DEG_LAT
+    lon = ref_lon + east / (METERS_PER_DEG_LAT * max(cos(radians(ref_lat)), 1e-8))
+    return lon, lat
 
 
 def pixel_to_geo_delta(
@@ -26,35 +48,14 @@ def pixel_to_geo_delta(
     pixel_dy: float,
     altitude_m: float,
     fx: float,
-    current_latitude_deg: float,
-    yaw_deg: float = 0.0,
-) -> tuple[float, float]:
-    """Convert image displacement to longitude and latitude increments.
-
-    Pixel displacement is first interpreted in the camera image plane, then
-    rotated into the local east/north frame by the calibrated yaw angle.
-    """
-
-    meters_per_pixel = altitude_m / max(float(fx), 1e-6)
-    delta_cam_x = pixel_dx * meters_per_pixel
-    delta_cam_y = pixel_dy * meters_per_pixel
-    yaw = radians(yaw_deg)
-    delta_east = cos(yaw) * delta_cam_x - sin(yaw) * delta_cam_y
-    delta_north = sin(yaw) * delta_cam_x + cos(yaw) * delta_cam_y
-    lat_rad = radians(current_latitude_deg)
-    delta_lat = delta_north / METERS_PER_DEG_LAT
-    delta_lon = delta_east / (METERS_PER_DEG_LAT * max(cos(lat_rad), 1e-6))
-    return float(delta_lon), float(delta_lat)
-
-
-def lonlat_to_local_m(
-    lon: np.ndarray,
-    lat: np.ndarray,
-    ref_lon: float,
-    ref_lat: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Convert lon/lat arrays to a local east/north plane for plotting."""
-
-    east = np.deg2rad(np.asarray(lon, dtype=float) - ref_lon) * EARTH_RADIUS_M * cos(radians(ref_lat))
-    north = np.deg2rad(np.asarray(lat, dtype=float) - ref_lat) * EARTH_RADIUS_M
-    return east, north
+    latitude_deg: float,
+    yaw_deg: float,
+) -> tuple[float, float, float, float, float]:
+    """Convert pixel displacement to lon/lat deltas with yaw correction."""
+    mpp = altitude_m / max(float(fx), 1e-6)
+    theta = radians(yaw_deg)
+    east = cos(theta) * pixel_dx * mpp - sin(theta) * pixel_dy * mpp
+    north = sin(theta) * pixel_dx * mpp + cos(theta) * pixel_dy * mpp
+    delta_lat = north / METERS_PER_DEG_LAT
+    delta_lon = east / (METERS_PER_DEG_LAT * max(cos(radians(latitude_deg)), 1e-8))
+    return delta_lon, delta_lat, east, north, mpp
